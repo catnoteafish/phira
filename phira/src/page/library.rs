@@ -8,7 +8,7 @@ use crate::{
     icons::Icons,
     popup::Popup,
     rate::RateDialog,
-    scene::{check_read_tos_and_policy, ChartOrder, JUST_LOADED_TOS, ORDERS},
+    scene::{check_read_tos_and_policy, confirm_delete, ChartOrder, JUST_LOADED_TOS, ORDERS},
     tabs::{Tabs, TitleFn},
     tags::TagsDialog,
     ttl,
@@ -24,8 +24,12 @@ use prpr::{
 use std::{
     any::Any,
     borrow::Cow,
+    collections::HashSet,
     ops::Deref,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tap::Tap;
 
@@ -85,6 +89,11 @@ pub struct LibraryPage {
     rating_last_show: bool,
     filter_show_tag: bool,
 
+    select_btn: DRectButton,
+    delete_btn: DRectButton,
+    is_selecting: bool,
+    ensure_delete: Arc<AtomicBool>,
+
     next_page: Option<NextPage>,
     next_page_task: LocalTask<Result<NextPage>>,
 }
@@ -133,11 +142,19 @@ impl LibraryPage {
             rating_last_show: false,
             filter_show_tag: true,
 
+            select_btn: DRectButton::new(),
+            delete_btn: DRectButton::new(),
+            is_selecting: false,
+            ensure_delete: Arc::new(AtomicBool::new(false)),
+
             next_page: None,
             next_page_task: None,
         })
     }
 }
+
+const DEBOUNCE: f64 = 0.4;
+const HOLD_TIME: f64 = 1.25;
 
 impl LibraryPage {
     fn total_page(&self, s: &SharedState) -> u64 {
@@ -291,7 +308,7 @@ impl Page for LibraryPage {
         if charts_view.transiting() {
             return Ok(true);
         }
-        if charts_view.touch(touch, t, s.rt)? {
+        if charts_view.touch_with_select(touch, t, s.rt, self.is_selecting, self.ensure_delete.clone())? {
             return Ok(true);
         }
         if !matches!(self.tabs.selected().ty, ChartListType::Local) {
@@ -315,6 +332,14 @@ impl Page for LibraryPage {
             ChartListType::Local => {
                 if self.import_btn.touch(touch, t) {
                     request_file("_import");
+                    return Ok(true);
+                }
+                if self.select_btn.touch(touch, t) {
+                    self.is_selecting = !self.is_selecting;
+                    return Ok(true);
+                }
+                if self.delete_btn.touch(touch, t) {
+                    confirm_delete(self.ensure_delete.clone());
                     return Ok(true);
                 }
                 if !self.search_str.is_empty() && self.search_clr_btn.touch(touch) {
@@ -404,13 +429,38 @@ impl Page for LibraryPage {
         }
         self.tags_last_show = self.tags.showing();
         self.rating_last_show = self.rating.showing();
+        if self.ensure_delete.load(Ordering::SeqCst) {
+            self.ensure_delete.store(false, Ordering::SeqCst);
+            let selected_indices = self.tabs.selected().view.get_selected_indices();
+            if !selected_indices.is_empty() {
+                match self.tabs.selected_mut().view.delete_charts_batch(selected_indices) {
+                    Ok(_count) => {
+                        self.is_selecting = false;
+                    }
+                    Err(e) => {
+                        show_error(e.context("Failed to schedule deletion"));
+                    }
+                }
+            }
+        }
         if let Some(task) = &mut self.online_task {
             if let Some(res) = task.take() {
                 match res {
                     Err(err) => show_error(err.context(tl!("failed-to-load-online"))),
                     Ok(res) => {
                         self.online_total_page = res.2;
-                        self.tabs.selected_mut().view.set(t, res.0);
+                        if self.tags.show_local {
+                            let local_ids: HashSet<i32> = s.charts_local.iter().filter_map(|it| it.info.id).collect();
+                            let filtered: Vec<ChartDisplayItem> = res
+                                .1
+                                .into_iter()
+                                .filter(|chart| local_ids.contains(&chart.id))
+                                .map(|chart: Chart| ChartDisplayItem::from_remote(&chart))
+                                .collect();
+                            self.tabs.selected_mut().view.set(t, filtered);
+                        } else {
+                            self.tabs.selected_mut().view.set(t, res.0);
+                        }
                     }
                 }
                 self.online_task = None;
@@ -501,13 +551,31 @@ impl Page for LibraryPage {
                 }
                 if chosen == ChartListType::Local {
                     let w = 0.24;
-                    r.x = r.x + r.w - w;
+                    r.x = r.x - r.h - 0.05;
                     r.w = w;
                     let ct = r.center();
                     self.import_btn.render_shadow(ui, r, t, |ui, path| {
                         ui.fill_path(&path, semi_black(0.4));
                     });
                     ui.text(tl!("import")).pos(ct.x, ct.y).anchor(0.5, 0.5).no_baseline().size(0.6).draw();
+
+                    r.w = r.h;
+                    r.x = r.x - r.w - 0.02;
+                    let ct = r.center();
+                    self.select_btn.render_shadow(ui, r, t, |ui, path| {
+                        ui.fill_path(&path, semi_black(0.4));
+                        ui.text("select").pos(ct.x, ct.y).anchor(0.5, 0.5).no_baseline().size(0.6).draw();
+
+                        // ui.fill_rect(select_r, (*self.icons.select, select_r, ScaleType::Fit));
+                    });
+
+                    r.x = r.x - r.w - 0.02;
+                    if self.is_selecting {
+                        self.delete_btn.render_shadow(ui, r, t, |ui, path| {
+                            ui.fill_path(&path, semi_black(0.4));
+                            // ui.fill_rect(delete_r, (*self.icons.delete, delete_r, ScaleType::Fit));
+                        });
+                    }
                 } else {
                     self.order_btn.render_shadow(ui, r, t, |ui, path| {
                         ui.fill_path(&path, semi_black(0.4));

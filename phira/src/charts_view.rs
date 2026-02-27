@@ -4,15 +4,14 @@ use crate::{
     icons::Icons,
     page::{ChartItem, ChartType, Fader, Illustration},
     save_data,
-    scene::{render_release_to_refresh, SongScene, MP_PANEL},
-    ttl,
+    scene::{MP_PANEL, SongScene, render_release_to_refresh},
 };
 use anyhow::Result;
 use macroquad::prelude::*;
 use prpr::{
     core::{Tweenable, BOLD_FONT},
     ext::{semi_black, RectExt, SafeTexture, BLACK_TEXTURE},
-    scene::{show_message, NextScene},
+    scene::{show_message, show_error, NextScene},
     task::Task,
     ui::{button_hit_large, DRectButton, Scroll, Ui},
 };
@@ -36,6 +35,8 @@ pub struct ChartDisplayItem {
     chart: Option<ChartItem>,
     symbol: Option<char>,
     btn: DRectButton,
+
+    is_selected: Option<bool>,
 }
 
 impl ChartDisplayItem {
@@ -44,6 +45,7 @@ impl ChartDisplayItem {
             chart,
             symbol,
             btn: DRectButton::new(),
+            is_selected: None,
         }
     }
 
@@ -52,7 +54,7 @@ impl ChartDisplayItem {
             Some(ChartItem {
                 info: chart.to_info(),
                 illu: {
-                    let notify = Arc::new(Notify::new());
+                    let notify: Arc<Notify> = Arc::new(Notify::new());
                     Illustration {
                         texture: (BLACK_TEXTURE.clone(), BLACK_TEXTURE.clone()),
                         notify: Arc::clone(&notify),
@@ -110,6 +112,11 @@ pub struct ChartsView {
     pub can_refresh: bool,
 
     pub clicked_special: bool,
+
+    ensure_delete: Arc<AtomicBool>,
+
+    delete_task: Option<Task<Result<usize>>>,
+    pending_delete_paths: Option<Vec<String>>,
 }
 
 impl ChartsView {
@@ -132,6 +139,10 @@ impl ChartsView {
             can_refresh: true,
 
             clicked_special: false,
+
+            ensure_delete: Arc::new(AtomicBool::new(false)),
+            delete_task: None,
+            pending_delete_paths: None,
         }
     }
 
@@ -172,14 +183,113 @@ impl ChartsView {
         NEED_UPDATE.fetch_and(false, Ordering::Relaxed)
     }
 
+    pub fn delete_charts_batch(&mut self, indices: Vec<u32>) -> Result<usize> {
+        if indices.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(charts) = &self.charts else {
+            return Ok(0);
+        };
+
+        let mut delete_paths = Vec::new();
+        for &idx in &indices {
+            if let Some(item) = charts.get(idx as usize) {
+                if let Some(chart) = &item.chart {
+                    let path = if let Some(path) = &chart.local_path {
+                        path.clone()
+                    } else {
+                        format!("download/{}", chart.info.id.unwrap_or(0))
+                    };
+                    delete_paths.push(path);
+                }
+            }
+        }
+
+        if delete_paths.is_empty() {
+            return Ok(0);
+        }
+        let paths_to_delete = delete_paths.clone();
+        self.pending_delete_paths = Some(delete_paths);
+        self.delete_task = Some(Task::new(async move {
+            let mut deleted_count: usize = 0;
+            let base = dir::charts()?;
+            for path in paths_to_delete {
+                let full = format!("{}/{path}", base);
+                if std::fs::remove_dir_all(&full).is_ok() {
+                    deleted_count += 1;
+                } else {
+                    show_error(anyhow::anyhow!(format!("Failed to delete chart at path: {full}")));
+                }
+            }
+            Ok(deleted_count)
+        }));
+
+        Ok(self.pending_delete_paths.as_ref().map(|v| v.len()).unwrap_or(0))
+    }
+
+    pub fn get_selected_indices(&self) -> Vec<u32> {
+        let Some(charts) = &self.charts else {
+            return Vec::new();
+        };
+
+        charts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| if item.is_selected == Some(true) { Some(idx as u32) } else { None })
+            .collect()
+    }
+
+    pub fn process_delete_task(&mut self) -> Result<()> {
+        if let Some(task) = &mut self.delete_task {
+            if let Some(res) = task.take() {
+                match res {
+                    Ok(count) => {
+                        if let Some(paths) = self.pending_delete_paths.take() {
+                            let data = get_data_mut();
+                            for path in paths {
+                                if let Some(idx) = data.find_chart_by_path(path.as_str()) {
+                                    data.charts.remove(idx);
+                                }
+                            }
+                            if count > 0 {
+                                let _ = save_data();
+                                NEED_UPDATE.store(true, Ordering::SeqCst);
+                                show_message(format!("Deleted {} chart(s)", count)).ok();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        show_error(e);
+                        self.pending_delete_paths.take();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check_delete(&self, v: bool) {
+        self.ensure_delete.store(v, Ordering::SeqCst);
+    }
+
     pub fn touch(&mut self, touch: &Touch, t: f32, rt: f32) -> Result<bool> {
+        self.touch_with_select(touch, t, rt, false, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn touch_with_select(&mut self, touch: &Touch, t: f32, rt: f32, is_selecting: bool, ensure_delete: Arc<AtomicBool>) -> Result<bool> {
+        self.ensure_delete.store(ensure_delete.load(Ordering::SeqCst), Ordering::SeqCst);
         if self.scroll.touch(touch, t) {
             return Ok(true);
         }
         if self.scroll.contains(touch) {
             if let Some(charts) = &mut self.charts {
                 for (id, item) in charts.iter_mut().enumerate() {
-                    if let Some(chart) = &item.chart {
+                    if is_selecting == true && item.btn.touch(touch, t) {
+                        item.is_selected = Some(item.is_selected != Some(true));
+                        return Ok(true);
+                    }
+                    if let Some(chart) = &mut item.chart {
                         if item.btn.touch(touch, t) {
                             button_hit_large();
                             let handled_by_mp = MP_PANEL.with(|it| {
@@ -245,36 +355,40 @@ impl ChartsView {
     }
 
     pub fn update(&mut self, t: f32) -> Result<bool> {
+        self.process_delete_task()?;
         let refreshed = self.can_refresh && self.scroll.y_scroller.pulled;
         self.scroll.update(t);
+        let mut do_delete = None;
+        let mut do_back = None;
+        let mut clear_transit = false;
+
         if let Some(transit) = &mut self.transit {
             transit.chart.illu.settle(t);
             if t > transit.start_time + TRANSIT_TIME {
                 if transit.back {
                     if transit.delete {
-                        let data = get_data_mut();
-                        let item = &self.charts.as_ref().unwrap()[transit.id as usize];
-                        let path = if let Some(path) = &item.chart.as_ref().unwrap().local_path {
-                            path.clone()
-                        } else {
-                            format!("download/{}", item.chart.as_ref().unwrap().info.id.unwrap())
-                        };
-                        std::fs::remove_dir_all(format!("{}/{path}", dir::charts()?))?;
-
-                        if let Some(chart) = data.find_chart_by_path(path.as_str()) {
-                            data.charts.remove(chart);
-                        }
-
-                        save_data()?;
-                        NEED_UPDATE.store(true, Ordering::SeqCst);
+                        do_delete = Some(transit.id);
                     } else {
-                        self.back_fade_in = Some((transit.id, t));
+                        do_back = Some(transit.id);
                     }
-                    self.transit = None;
+                    clear_transit = true;
                 } else {
                     transit.done = true;
                 }
             }
+        }
+
+        if let Some(id) = do_delete {
+            if self.ensure_delete.load(Ordering::SeqCst) {
+            let _ = self.delete_charts_batch(vec![id])?;
+            self.check_delete(false);
+            }
+        }
+        if let Some(id) = do_back {
+            self.back_fade_in = Some((id, t));
+        }
+        if clear_transit {
+            self.transit = None;
         }
 
         if let Some(charts) = &mut self.charts {
@@ -327,7 +441,7 @@ impl ChartsView {
                                 item.btn.invalidate();
                             }
                             return;
-                        }
+                        }    
                         f.render(ui, t, |ui| {
                             let mut c = WHITE;
 
@@ -338,6 +452,10 @@ impl ChartsView {
                                     chart.illu.notify();
                                     ui.fill_path(&path, semi_black(c.a));
                                     ui.fill_path(&path, chart.illu.shading(r.feather(0.01), t));
+                                    let selected = item.is_selected == Some(true);
+                                    if selected {
+                                        ui.fill_path(&path, Color::new(0.12, 0.35, 0.95, 0.45));
+                                    }
                                     if let Some((that_id, start_time)) = &self.back_fade_in {
                                         if id == *that_id {
                                             let p = ((t - start_time) / BACK_FADE_IN_TIME).max(0.);

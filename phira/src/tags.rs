@@ -125,6 +125,8 @@ pub struct TagsDialog {
 
     pub btn_me: DRectButton,
     pub show_me: bool,
+    pub btn_local: DRectButton,
+    pub show_local: bool,
     pub btn_unreviewed: DRectButton,
     pub show_unreviewed: bool,
     pub btn_stabilize: DRectButton,
@@ -152,7 +154,9 @@ impl TagsDialog {
             div_btns: DIVISION_TAGS.iter().map(|_| DRectButton::new()).collect(),
 
             btn_me: DRectButton::new(),
+            btn_local: DRectButton::new(),
             show_me: false,
+            show_local: false,
             btn_unreviewed: DRectButton::new(),
             show_unreviewed: false,
             btn_stabilize: DRectButton::new(),
@@ -222,6 +226,10 @@ impl TagsDialog {
             }
             if self.btn_me.touch(touch, t) {
                 self.show_me ^= true;
+                return true;
+            }
+            if self.btn_local.touch(touch, t) {
+                self.show_local ^= true;
                 return true;
             }
             if self.btn_unreviewed.touch(touch, t) {
@@ -303,7 +311,7 @@ impl TagsDialog {
                             let mut h = bh + 0.01;
                             ui.dy(h);
                             if self.unwanted.is_some() {
-                                let mut row: SmallVec<[_; 3]> = smallvec![(&mut self.btn_me, "filter-me", self.show_me)];
+                                let mut row: SmallVec<[_; 4]> = smallvec![(&mut self.btn_me, "filter-me", self.show_me), (&mut self.btn_local, "filter-local", self.show_local)];
                                 if self.perms.contains(Permissions::SEE_UNREVIEWED) {
                                     row.push((&mut self.btn_unreviewed, "filter-unreviewed", self.show_unreviewed));
                                 }
